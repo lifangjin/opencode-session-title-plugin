@@ -1,6 +1,10 @@
 # Dependencies
 node_modules/
 
+# Lockfiles - keep only package-lock.json (npm)
+bun.lock
+bun.lockb
+
 # Build output
 dist/
 
