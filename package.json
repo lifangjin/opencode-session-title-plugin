@@ -1,6 +1,6 @@
 {
   "name": "@lifangjin/opencode-session-title-plugin",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Filter irrelevant system-prompt injections from opencode session title generation to save tokens",
   "type": "module",
   "author": "lifangjin <lifangjin@gmail.com> (https://github.com/lifangjin)",
@@ -52,5 +52,8 @@
   },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.4.0"
+  },
+  "dependencies": {
+    "gpt-tokenizer": "^3.4.0"
   }
 }

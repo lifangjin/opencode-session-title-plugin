@@ -1,4 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin"
+import { countTokens as countTokensCl100k } from "gpt-tokenizer"
+import { countTokens as countTokensO200k } from "gpt-tokenizer/encoding/o200k_base"
 
 /**
  * Session Title Filter Plugin options.
@@ -60,10 +62,20 @@ const TITLE_USER_MSG_MARKER = "Generate a title for this conversation"
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
-/** Rough token estimate: ~4 chars per token for mixed English/code text. */
-const CHARS_PER_TOKEN = 3
-const estimateTokens = (chars: number): number =>
-  Math.max(0, Math.round(chars / CHARS_PER_TOKEN))
+/**
+ * Select the correct tokenizer encoding for a given model.
+ *
+ * gpt-tokenizer defaults to cl100k_base (GPT-4 / GPT-3.5). GPT-4o family
+ * and o1/o3 reasoning models use o200k_base. Non-OpenAI models (Claude,
+ * Gemini, etc.) have no public JS tokenizer; cl100k_base is used as a
+ * close approximation (typically within ±5% for English/code text).
+ */
+const isO200kModel = (modelID: string): boolean => {
+  const id = modelID.toLowerCase()
+  return id.includes("4o") || /^o[13]\b/.test(id) || id.includes("chatgpt-4o")
+}
+const pickTokenCounter = (modelID: string): ((text: string) => number) =>
+  isO200kModel(modelID) ? countTokensO200k : countTokensCl100k
 
 /** Polling interval (ms) for monitorTitleAndNotify. */
 const POLL_INTERVAL_MS = 1000
@@ -150,7 +162,7 @@ async function monitorTitleAndNotify(
       if (title && title !== initialTitle && !isDefaultTitle(title)) {
         const message =
           savedTokens > 0
-            ? `"${title}" | title call saved ~${savedTokens} tokens`
+            ? `"${title}" | title call saved ${savedTokens} tokens`
             : `"${title}" generated with stripped system prompt`
         try {
           await input.client.tui.showToast({
@@ -237,29 +249,36 @@ export const SessionTitleFilterPlugin: Plugin = async (input, options: SessionTi
         return
       }
 
-      const originalChars = system.reduce(
-        (sum, s) => sum + (typeof s === "string" ? s.length : 0),
-        0,
-      )
+      // Read model from hook input to select the correct tokenizer encoding.
+      // model is read-only in the hook (it's in `input`, not `output`) but
+      // fully accessible for tokenizer selection.
+      const modelInfo = (hookInput as { model?: { id?: string } })?.model
+      const modelID = modelInfo?.id ?? ""
+      const countTokens = pickTokenCounter(modelID)
+
+      const originalText = system
+        .filter((s): s is string => typeof s === "string")
+        .join("\n")
+      const originalTokens = countTokens(originalText)
 
       log(
-        "title generation detected, original system entries:",
-        system.length,
-        "sizes:",
-        system.map((s) => (typeof s === "string" ? s.length : 0)),
+        "title generation detected, model:", modelID || "unknown",
+        "original system entries:", system.length,
+        "sizes:", system.map((s) => (typeof s === "string" ? s.length : 0)),
+        "tokens:", originalTokens,
       )
 
       const pureTitle = extractPureTitle(system[titleIndex])
       system.length = 0
       system.push(pureTitle)
 
-      const filteredChars = pureTitle.length
-      const savedTokens = estimateTokens(originalChars - filteredChars)
+      const filteredTokens = countTokens(pureTitle)
+      const savedTokens = Math.max(0, originalTokens - filteredTokens)
 
       log(
         "filtered system entries:", system.length,
-        "total chars:", filteredChars,
-        "saved ~", savedTokens, "tokens",
+        "tokens:", filteredTokens,
+        "saved", savedTokens, "tokens",
       )
 
       if (notify) {

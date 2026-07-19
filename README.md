@@ -96,10 +96,10 @@ When `notify` is on (default), the plugin polls `session.get` after filtering an
 
 ```
 Session title ready
-"<generated title>" | title call saved ~1234 tokens
+"<generated title>" | title call saved 1234 tokens
 ```
 
-The hook fires before the LLM call, so the plugin cannot synchronously know the finished title - it polls once per second up to `notifyTimeout`. Token savings are estimated as `(original_system_chars - filtered_chars) / 4` and rounded. The toast uses opencode's SDK `client.tui.showToast` API, which only renders when a TUI is connected (headless runs silently skip).
+The hook fires before the LLM call, so the plugin cannot synchronously know the finished title - it polls once per second up to `notifyTimeout`. Token savings are calculated with [gpt-tokenizer](https://github.com/niieani/gpt-tokenizer): the hook's `model` field selects the encoding (cl100k_base for GPT-4/3.5, o200k_base for GPT-4o/o1/o3), giving exact counts for OpenAI models and a close approximation (±5%) for other providers. The toast uses opencode's SDK `client.tui.showToast` API, which only renders when a TUI is connected (headless runs silently skip).
 
 ## Using a cheaper model for title generation
 
@@ -140,11 +140,11 @@ Verify the active model in the opencode log: the `stream` line's `modelID` field
 Start a new opencode session. With `debug: true`, check the opencode log for:
 
 ```
-[session-title-filter] title generation detected, original system entries: N sizes: [...]
-[session-title-filter] filtered system entries: 1 total chars: ~1200
+[session-title-filter] title generation detected, model: <model-id> original system entries: N sizes: [...] tokens: <n>
+[session-title-filter] filtered system entries: 1 tokens: <n> saved <n> tokens
 ```
 
-`total chars` should be around 1200 (the size of `PROMPT_TITLE`). If it is much larger, other plugins are still injecting into the same system string — open an issue with the log output.
+`tokens` for the filtered system should be around 300 (the size of `PROMPT_TITLE`). If it is much larger, other plugins are still injecting into the same system string — open an issue with the log output.
 
 ## Compatibility
 

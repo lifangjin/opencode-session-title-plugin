@@ -96,10 +96,10 @@ You are a title generator. You output ONLY a thread title. Nothing else.
 
 ```
 Session title ready
-"<generated title>" | title call saved ~1234 tokens
+"<generated title>" | title call saved 1234 tokens
 ```
 
-hook 在 LLM 调用前触发，因此插件无法同步获知最终标题——它每秒轮询一次，最多持续 `notifyTimeout` 秒。token 节省量按 `(原始 system 字符数 - 过滤后字符数) / 4` 估算并取整。toast 使用 opencode SDK 的 `client.tui.showToast` API，仅在 TUI 连接时渲染（无头模式静默跳过）。
+hook 在 LLM 调用前触发，因此插件无法同步获知最终标题——它每秒轮询一次，最多持续 `notifyTimeout` 秒。token 节省量使用 [gpt-tokenizer](https://github.com/niieani/gpt-tokenizer) 精确计算：根据 hook 中的 `model` 字段选择 tokenizer encoding（GPT-4/3.5 用 cl100k_base，GPT-4o/o1/o3 用 o200k_base），对 OpenAI 模型精确，其他模型以 cl100k_base 近似（±5%）。toast 使用 opencode SDK 的 `client.tui.showToast` API，仅在 TUI 连接时渲染（无头模式静默跳过）。
 
 ## 为标题生成使用更便宜的模型
 
@@ -140,11 +140,11 @@ opencode title agent 的模型优先级（来源：`packages/opencode/src/sessio
 新建一个 opencode 会话。开启 `debug: true` 后，检查 opencode 日志：
 
 ```
-[session-title-filter] title generation detected, original system entries: N sizes: [...]
-[session-title-filter] filtered system entries: 1 total chars: ~1200
+[session-title-filter] title generation detected, model: <model-id> original system entries: N sizes: [...] tokens: <n>
+[session-title-filter] filtered system entries: 1 tokens: <n> saved <n> tokens
 ```
 
-`total chars` 应在 1200 左右（`PROMPT_TITLE` 的大小）。如果远大于此，说明其他插件仍在向同一 system 字符串注入——请带日志输出提交 issue。
+`tokens`（过滤后）应在 300 左右（`PROMPT_TITLE` 的大小）。如果远大于此，说明其他插件仍在向同一 system 字符串注入——请带日志输出提交 issue。
 
 ## 兼容性
 
