@@ -36,7 +36,7 @@ You are a title generator. You output ONLY a thread title. Nothing else.
 // ~/.config/opencode/opencode.json
 {
   "plugin": [
-    "@lifangjin/opencode-session-title-plugin"
+    "@lifangjin/opencode-session-title-plugin@latest"
   ]
 }
 ```
@@ -46,7 +46,7 @@ You are a title generator. You output ONLY a thread title. Nothing else.
 ```jsonc
 {
   "plugin": [
-    ["@lifangjin/opencode-session-title-plugin", { "debug": true }]
+    ["@lifangjin/opencode-session-title-plugin@latest", { "debug": true }]
   ]
 }
 ```

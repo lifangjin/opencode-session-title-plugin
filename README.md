@@ -36,7 +36,7 @@ Detection is content-based because `experimental.chat.system.transform` receives
 // ~/.config/opencode/opencode.json
 {
   "plugin": [
-    "@lifangjin/opencode-session-title-plugin"
+    "@lifangjin/opencode-session-title-plugin@latest"
   ]
 }
 ```
@@ -46,7 +46,7 @@ Detection is content-based because `experimental.chat.system.transform` receives
 ```jsonc
 {
   "plugin": [
-    ["@lifangjin/opencode-session-title-plugin", { "debug": true }]
+    ["@lifangjin/opencode-session-title-plugin@latest", { "debug": true }]
   ]
 }
 ```
