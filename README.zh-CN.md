@@ -69,15 +69,15 @@ You are a title generator. You output ONLY a thread title. Nothing else.
    或复制构建产物：
 
    ```sh
-   cp dist/index.js ~/.config/opencode/plugins/session-title-filter.js
+   cp dist/index.js ~/.config/opencode/plugins/opencode-session-title-plugin.js
    ```
 
 3. 在 `opencode.json` 中注册：
 
    ```jsonc
    {
-    "plugin": ["./plugins/session-title-filter.js"]
-  }
+     "plugin": ["./plugins/opencode-session-title-plugin.js"]
+   }
    ```
 
 ## 选项

@@ -69,14 +69,14 @@ Detection is content-based because `experimental.chat.system.transform` receives
    Or copy the built entry:
 
    ```sh
-   cp dist/index.js ~/.config/opencode/plugins/session-title-filter.js
+   cp dist/index.js ~/.config/opencode/plugins/opencode-session-title-plugin.js
    ```
 
 3. Register in `opencode.json`:
 
    ```jsonc
    {
-     "plugin": ["./plugins/session-title-filter.js"]
+     "plugin": ["./plugins/opencode-session-title-plugin.js"]
    }
    ```
 
