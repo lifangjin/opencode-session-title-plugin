@@ -83,6 +83,12 @@ const POLL_INTERVAL_MS = 1000
 const POLL_MAX_INTERVAL_MS = 5000
 /** TUI toast display duration (ms). */
 const TOAST_DURATION_MS = 5000
+/** Fallback delay (ms): if messages.transform hasn't fired after system.transform,
+ * show the toast with system-only savings. */
+const FALLBACK_DELAY_MS = 5000
+/** How long to remember a session has already toasted (ms), to prevent
+ * duplicate toasts from LLM retries. */
+const TOAST_DEDUP_MS = 60_000
 
 /**
  * opencode sets a default title on new sessions before the title agent runs.
@@ -134,7 +140,14 @@ type ClientLike = {
  * generation runs async in the background. Poll session.get approximately
  * every POLL_INTERVAL_MS (plus RPC latency) until the title flips from its
  * default to a real value, then fire a TUI toast.
+ *
+ * Dedup: `toastedSessions` prevents duplicate toasts when the LLM call is
+ * retried (each retry fires system.transform → messages.transform → another
+ * monitor). Once a toast has been shown for a session, subsequent monitors
+ * exit silently.
  */
+const toastedSessions = new Set<string>()
+
 async function monitorTitleAndNotify(
   input: { client: ClientLike },
   sessionID: string,
@@ -142,6 +155,11 @@ async function monitorTitleAndNotify(
   timeoutSec: number,
   log: (...args: unknown[]) => void,
 ): Promise<void> {
+  if (toastedSessions.has(sessionID)) {
+    log("notify: toast already shown for session, skipping duplicate")
+    return
+  }
+
   let initialTitle: string | undefined
   try {
     const res = await input.client.session.get({ path: { id: sessionID } })
@@ -160,6 +178,13 @@ async function monitorTitleAndNotify(
       const res = await input.client.session.get({ path: { id: sessionID } })
       const title = res?.data?.title
       if (title && title !== initialTitle && !isDefaultTitle(title)) {
+        if (toastedSessions.has(sessionID)) {
+          log("notify: toast already shown by a concurrent monitor, skipping")
+          return
+        }
+        toastedSessions.add(sessionID)
+        setTimeout(() => toastedSessions.delete(sessionID), TOAST_DEDUP_MS)
+
         const message =
           savedTokens > 0
             ? `"${title}" | title call saved ${savedTokens} tokens`
@@ -173,7 +198,7 @@ async function monitorTitleAndNotify(
               duration: TOAST_DURATION_MS,
             },
           })
-          log("notify: toast shown for title:", title)
+          log("notify: toast shown for title:", title, "savedTokens:", savedTokens)
         } catch (e) {
           log("notify: showToast failed:", e)
         }
@@ -211,14 +236,30 @@ export const SessionTitleFilterPlugin: Plugin = async (input, options: SessionTi
     ? (...args: unknown[]) => console.error("[session-title-filter]", ...args)
     : () => {}
 
-  // Narrow via `unknown` to decouple from SDK version drift in @opencode-ai/plugin's
-  // bundled client type. Runtime calls are guarded with try/catch in monitorTitleAndNotify.
+  // ── Shared state for combining savings from system.transform + messages.transform ──
+  //
+  // opencode fires system.transform BEFORE messages.transform within the same
+  // LLM call. Project-specific content (AGENTS.md, magic-context memory, skill
+  // listings) is injected as system/developer role MESSAGES by other plugins'
+  // messages.transform hooks, not as system array entries. Our system.transform
+  // strips the system array (constant content -> constant savings), and our
+  // messages.transform strips system/developer messages (project-specific ->
+  // variable savings). To report the TOTAL, we stash system savings keyed by
+  // sessionID in system.transform, then pick them up and add message savings
+  // in messages.transform before showing the toast.
+
+  /** systemSaved + modelID stashed by system.transform for messages.transform to pick up. */
+  const systemSavedBySession = new Map<string, { saved: number; modelID: string }>()
+  /** Fallback timers: if messages.transform doesn't fire within FALLBACK_DELAY_MS,
+   * show the toast with system-only savings (e.g. when filterMessages is false
+   * or the LLM call fails before messages.transform). */
+  const fallbackTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
   const extractPureTitle = (entry: string): string => {
     // opencode 在 LLMRequestPrep.prepare 中先把 agent.prompt + e.system +
     // user.system 用 "\n" join 成单个字符串再放入 system 数组（初始 length=1）。
     // 其他 plugin（magic-context、oh-my-opencode-slim 等）还可能往 system 里
-    // push 新 entry。因此 PROMPT_TITLE 不一定在 entry 开头——它可能被拼接在
+    // push 新 entry。因此 PROMPT_TITLE 不一定在 entry 开头--它可能被拼接在
     // 当前 agent 的 system prompt 之后（实测 title 调用里 PROMPT_TITLE 在最后）。
     // 用 indexOf 定位 TITLE_MARKER 在 entry 中的任意起点，再找 TITLE_PROMPT_END
     // 终点，slice 出纯 PROMPT_TITLE 段。startsMarker 失败会导致整个过滤短路。
@@ -230,6 +271,26 @@ export const SessionTitleFilterPlugin: Plugin = async (input, options: SessionTi
       return entry
     }
     return entry.slice(startIdx, endIdx + TITLE_PROMPT_END.length)
+  }
+
+  /** Estimate token count of a message by extracting text from its parts. */
+  const estimateMessageTokens = (
+    msg: { info?: { role?: string }; parts?: unknown[] },
+    countTokens: (text: string) => number,
+  ): number => {
+    const parts = msg?.parts
+    if (!Array.isArray(parts)) return 0
+    const text = parts
+      .filter(
+        (p): p is { type: string; text: string } =>
+          typeof p === "object" &&
+          p !== null &&
+          (p as { type?: string }).type === "text" &&
+          typeof (p as { text?: unknown }).text === "string",
+      )
+      .map((p) => p.text)
+      .join("\n")
+    return text ? countTokens(text) : 0
   }
 
   const systemTransform: NonNullable<
@@ -250,8 +311,6 @@ export const SessionTitleFilterPlugin: Plugin = async (input, options: SessionTi
       }
 
       // Read model from hook input to select the correct tokenizer encoding.
-      // model is read-only in the hook (it's in `input`, not `output`) but
-      // fully accessible for tokenizer selection.
       const modelInfo = (hookInput as { model?: { id?: string } })?.model
       const modelID = modelInfo?.id ?? ""
       const countTokens = pickTokenCounter(modelID)
@@ -273,20 +332,40 @@ export const SessionTitleFilterPlugin: Plugin = async (input, options: SessionTi
       system.push(pureTitle)
 
       const filteredTokens = countTokens(pureTitle)
-      const savedTokens = Math.max(0, originalTokens - filteredTokens)
+      const systemSaved = Math.max(0, originalTokens - filteredTokens)
 
       log(
         "filtered system entries:", system.length,
         "tokens:", filteredTokens,
-        "saved", savedTokens, "tokens",
+        "system saved", systemSaved, "tokens",
       )
 
       if (notify) {
         const sessionID = (hookInput as { sessionID?: string })?.sessionID
         if (sessionID) {
-          monitorTitleAndNotify(input as unknown as { client: ClientLike }, sessionID, savedTokens, notifyTimeout, log).catch((e) =>
-            log("notify: monitor error:", e),
-          )
+          if (filterMessages) {
+            // Stash system savings for messages.transform to combine with message savings.
+            // messages.transform fires after system.transform in the same LLM call.
+            systemSavedBySession.set(sessionID, { saved: systemSaved, modelID })
+
+            // Fallback: if messages.transform doesn't fire (LLM error, etc.),
+            // still show the toast with system-only savings.
+            const timer = setTimeout(() => {
+              fallbackTimers.delete(sessionID)
+              systemSavedBySession.delete(sessionID)
+              monitorTitleAndNotify(
+                input as unknown as { client: ClientLike },
+                sessionID, systemSaved, notifyTimeout, log,
+              ).catch((e) => log("notify: monitor error (fallback):", e))
+            }, FALLBACK_DELAY_MS)
+            fallbackTimers.set(sessionID, timer)
+          } else {
+            // No messages.transform registered; show toast directly with system savings.
+            monitorTitleAndNotify(
+              input as unknown as { client: ClientLike },
+              sessionID, systemSaved, notifyTimeout, log,
+            ).catch((e) => log("notify: monitor error:", e))
+          }
         } else {
           log("notify: no sessionID in hook input, skipping toast")
         }
@@ -300,7 +379,7 @@ export const SessionTitleFilterPlugin: Plugin = async (input, options: SessionTi
     ? (async (_hookInput: Record<string, never>, hookOutputRaw: unknown) => {
         try {
           const hookOutput = hookOutputRaw as {
-            messages: Array<{ info: { role?: string }; parts: unknown[] }>
+            messages: Array<{ info: { role?: string; sessionID?: string }; parts: unknown[] }>
           }
           const messages = hookOutput.messages
           if (!Array.isArray(messages) || messages.length === 0) return
@@ -317,25 +396,70 @@ export const SessionTitleFilterPlugin: Plugin = async (input, options: SessionTi
           })
           if (!looksLikeTitleCall) return
 
+          // Extract sessionID from the first message that has one.
+          const sessionID = messages.find((m) => m?.info?.sessionID)?.info?.sessionID
+
           if (!enabled) {
-            // 与 system.transform 对齐：detect-only 模式，便于 debug 排查
             log("title generation detected (disabled, no filtering), messages:", messages.length)
             return
           }
+
+          // Compute tokens saved from removing system/developer messages.
+          // This is where project-specific content (AGENTS.md, magic-context
+          // memory, skill listings) lives - it's injected as system-role
+          // messages by other plugins, not in the system array.
+          const systemEntry = sessionID ? systemSavedBySession.get(sessionID) : undefined
+          const modelID = systemEntry?.modelID ?? ""
+          const countTokens = pickTokenCounter(modelID)
+
+          const removedMessages = messages.filter((m) => {
+            const role = m?.info?.role ?? (m as { role?: string })?.role
+            return role === "system" || role === "developer"
+          })
+          const messageSaved = removedMessages.reduce(
+            (sum, m) => sum + estimateMessageTokens(m, countTokens),
+            0,
+          )
 
           const before = messages.length
           const kept = messages.filter((m) => {
             const role = m?.info?.role ?? (m as { role?: string })?.role
             return role !== "system" && role !== "developer"
           })
-          if (kept.length === before) {
-            log("messages.transform: title call detected, no system/developer entries to remove")
-            return
+
+          if (kept.length < before) {
+            messages.length = 0
+            kept.forEach((m) => messages.push(m))
           }
 
-          messages.length = 0
-          kept.forEach((m) => messages.push(m))
-          log("filtered messages: removed", before - kept.length, "system/developer entries")
+          // Combine system + message savings for the toast.
+          const systemSaved = systemEntry?.saved ?? 0
+          const totalSaved = systemSaved + messageSaved
+
+          log(
+            "messages.transform: title call detected,",
+            "removed", before - kept.length, "system/developer entries,",
+            "message saved", messageSaved, "tokens,",
+            "system saved", systemSaved, "tokens,",
+            "total saved", totalSaved, "tokens",
+          )
+
+          // Clean up shared state.
+          if (sessionID) {
+            systemSavedBySession.delete(sessionID)
+            const timer = fallbackTimers.get(sessionID)
+            if (timer) {
+              clearTimeout(timer)
+              fallbackTimers.delete(sessionID)
+            }
+
+            if (notify) {
+              monitorTitleAndNotify(
+                input as unknown as { client: ClientLike },
+                sessionID, totalSaved, notifyTimeout, log,
+              ).catch((e) => log("notify: monitor error:", e))
+            }
+          }
         } catch (e) {
           log("messages.transform error:", e)
         }
