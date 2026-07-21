@@ -128,6 +128,10 @@ async function showToastImmediate(
   savedTokens: number,
   log: (...args: unknown[]) => void,
 ): Promise<void> {
+  if (savedTokens <= 0) {
+    log("notify: savedTokens <= 0, skipping toast")
+    return
+  }
   if (toastedSessions.has(sessionID)) {
     log("notify: toast already shown for session, skipping duplicate")
     return
@@ -135,10 +139,7 @@ async function showToastImmediate(
   toastedSessions.add(sessionID)
   setTimeout(() => toastedSessions.delete(sessionID), TOAST_DEDUP_MS)
 
-  const message =
-    savedTokens > 0
-      ? `Title call saved ${savedTokens} tokens`
-      : `Title call system prompt stripped`
+  const message = `Title call saved ${savedTokens} tokens`
   try {
     await input.client.tui.showToast({
       body: {
