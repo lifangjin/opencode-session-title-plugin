@@ -53,13 +53,6 @@ const TITLE_MARKER = "You are a title generator"
  */
 const TITLE_PROMPT_END = "</examples>"
 
-/**
- * The title agent's user message starts with this prefix. Used to detect
- * title-generation calls inside `experimental.chat.messages.transform`,
- * which does not receive a sessionID.
- */
-const TITLE_USER_MSG_MARKER = "Generate a title for this conversation"
-
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
 /**
@@ -83,9 +76,6 @@ const POLL_INTERVAL_MS = 1000
 const POLL_MAX_INTERVAL_MS = 5000
 /** TUI toast display duration (ms). */
 const TOAST_DURATION_MS = 5000
-/** Fallback delay (ms): if messages.transform hasn't fired after system.transform,
- * show the toast with system-only savings. */
-const FALLBACK_DELAY_MS = 5000
 /** How long to remember a session has already toasted (ms), to prevent
  * duplicate toasts from LLM retries. */
 const TOAST_DEDUP_MS = 60_000
@@ -228,7 +218,6 @@ async function monitorTitleAndNotify(
 export const SessionTitleFilterPlugin: Plugin = async (input, options: SessionTitleFilterOptions = {}) => {
   const debug = options.debug === true
   const enabled = options.enabled !== false
-  const filterMessages = options.filterMessages !== false
   const notify = options.notify !== false
   const notifyTimeout = options.notifyTimeout && options.notifyTimeout > 0 ? options.notifyTimeout : 30
 
@@ -236,33 +225,15 @@ export const SessionTitleFilterPlugin: Plugin = async (input, options: SessionTi
     ? (...args: unknown[]) => console.error("[session-title-filter]", ...args)
     : () => {}
 
-  // ── Shared state for combining savings from system.transform + messages.transform ──
-  //
-  // opencode fires system.transform BEFORE messages.transform within the same
-  // LLM call. Project-specific content (AGENTS.md, magic-context memory, skill
-  // listings) is injected as system/developer role MESSAGES by other plugins'
-  // messages.transform hooks, not as system array entries. Our system.transform
-  // strips the system array (constant content -> constant savings), and our
-  // messages.transform strips system/developer messages (project-specific ->
-  // variable savings). To report the TOTAL, we stash system savings keyed by
-  // sessionID in system.transform, then pick them up and add message savings
-  // in messages.transform before showing the toast.
-
-  /** systemSaved + modelID stashed by system.transform for messages.transform to pick up. */
-  const systemSavedBySession = new Map<string, { saved: number; modelID: string }>()
-  /** Fallback timers: if messages.transform doesn't fire within FALLBACK_DELAY_MS,
-   * show the toast with system-only savings (e.g. when filterMessages is false
-   * or the LLM call fails before messages.transform). */
-  const fallbackTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  log("plugin v0.0.4 loaded, enabled:", enabled, "notify:", notify)
 
   const extractPureTitle = (entry: string): string => {
     // opencode 在 LLMRequestPrep.prepare 中先把 agent.prompt + e.system +
     // user.system 用 "\n" join 成单个字符串再放入 system 数组（初始 length=1）。
     // 其他 plugin（magic-context、oh-my-opencode-slim 等）还可能往 system 里
-    // push 新 entry。因此 PROMPT_TITLE 不一定在 entry 开头--它可能被拼接在
-    // 当前 agent 的 system prompt 之后（实测 title 调用里 PROMPT_TITLE 在最后）。
+    // push 新 entry 或修改已有 entry。因此 PROMPT_TITLE 不一定在 entry 开头。
     // 用 indexOf 定位 TITLE_MARKER 在 entry 中的任意起点，再找 TITLE_PROMPT_END
-    // 终点，slice 出纯 PROMPT_TITLE 段。startsMarker 失败会导致整个过滤短路。
+    // 终点，slice 出纯 PROMPT_TITLE 段。
     const startIdx = entry.indexOf(TITLE_MARKER)
     if (startIdx === -1) return entry
     const endIdx = entry.indexOf(TITLE_PROMPT_END, startIdx)
@@ -271,26 +242,6 @@ export const SessionTitleFilterPlugin: Plugin = async (input, options: SessionTi
       return entry
     }
     return entry.slice(startIdx, endIdx + TITLE_PROMPT_END.length)
-  }
-
-  /** Estimate token count of a message by extracting text from its parts. */
-  const estimateMessageTokens = (
-    msg: { info?: { role?: string }; parts?: unknown[] },
-    countTokens: (text: string) => number,
-  ): number => {
-    const parts = msg?.parts
-    if (!Array.isArray(parts)) return 0
-    const text = parts
-      .filter(
-        (p): p is { type: string; text: string } =>
-          typeof p === "object" &&
-          p !== null &&
-          (p as { type?: string }).type === "text" &&
-          typeof (p as { text?: unknown }).text === "string",
-      )
-      .map((p) => p.text)
-      .join("\n")
-    return text ? countTokens(text) : 0
   }
 
   const systemTransform: NonNullable<
@@ -315,57 +266,52 @@ export const SessionTitleFilterPlugin: Plugin = async (input, options: SessionTi
       const modelID = modelInfo?.id ?? ""
       const countTokens = pickTokenCounter(modelID)
 
+      // ── Detailed debug: dump every system entry ──
+      for (let i = 0; i < system.length; i++) {
+        const entry = system[i]
+        if (typeof entry !== "string") {
+          log(`  system[${i}]: <non-string ${typeof entry}>`)
+          continue
+        }
+        const head = entry.slice(0, 120)
+        const tail = entry.slice(-120)
+        log(`  system[${i}]: len=${entry.length} head=${JSON.stringify(head)} tail=${JSON.stringify(tail)}`)
+      }
+
       const originalText = system
         .filter((s): s is string => typeof s === "string")
         .join("\n")
       const originalTokens = countTokens(originalText)
 
       log(
-        "title generation detected, model:", modelID || "unknown",
-        "original system entries:", system.length,
-        "sizes:", system.map((s) => (typeof s === "string" ? s.length : 0)),
-        "tokens:", originalTokens,
+        "title call: model:", modelID || "unknown",
+        "entries:", system.length,
+        "titleIndex:", titleIndex,
+        "originalText.len:", originalText.length,
+        "originalTokens:", originalTokens,
       )
 
-      const pureTitle = extractPureTitle(system[titleIndex])
+      const pureTitle = extractPureTitle(system[titleIndex] as string)
       system.length = 0
       system.push(pureTitle)
 
       const filteredTokens = countTokens(pureTitle)
-      const systemSaved = Math.max(0, originalTokens - filteredTokens)
+      const savedTokens = Math.max(0, originalTokens - filteredTokens)
 
       log(
-        "filtered system entries:", system.length,
-        "tokens:", filteredTokens,
-        "system saved", systemSaved, "tokens",
+        "filtered: pureTitle.len:", pureTitle.length,
+        "pureTitle.head:", JSON.stringify(pureTitle.slice(0, 80)),
+        "filteredTokens:", filteredTokens,
+        "savedTokens:", savedTokens,
       )
 
       if (notify) {
         const sessionID = (hookInput as { sessionID?: string })?.sessionID
         if (sessionID) {
-          if (filterMessages) {
-            // Stash system savings for messages.transform to combine with message savings.
-            // messages.transform fires after system.transform in the same LLM call.
-            systemSavedBySession.set(sessionID, { saved: systemSaved, modelID })
-
-            // Fallback: if messages.transform doesn't fire (LLM error, etc.),
-            // still show the toast with system-only savings.
-            const timer = setTimeout(() => {
-              fallbackTimers.delete(sessionID)
-              systemSavedBySession.delete(sessionID)
-              monitorTitleAndNotify(
-                input as unknown as { client: ClientLike },
-                sessionID, systemSaved, notifyTimeout, log,
-              ).catch((e) => log("notify: monitor error (fallback):", e))
-            }, FALLBACK_DELAY_MS)
-            fallbackTimers.set(sessionID, timer)
-          } else {
-            // No messages.transform registered; show toast directly with system savings.
-            monitorTitleAndNotify(
-              input as unknown as { client: ClientLike },
-              sessionID, systemSaved, notifyTimeout, log,
-            ).catch((e) => log("notify: monitor error:", e))
-          }
+          monitorTitleAndNotify(
+            input as unknown as { client: ClientLike },
+            sessionID, savedTokens, notifyTimeout, log,
+          ).catch((e) => log("notify: monitor error:", e))
         } else {
           log("notify: no sessionID in hook input, skipping toast")
         }
@@ -375,102 +321,8 @@ export const SessionTitleFilterPlugin: Plugin = async (input, options: SessionTi
     }
   }
 
-  const messagesTransform = filterMessages
-    ? (async (_hookInput: Record<string, never>, hookOutputRaw: unknown) => {
-        try {
-          const hookOutput = hookOutputRaw as {
-            messages: Array<{ info: { role?: string; sessionID?: string }; parts: unknown[] }>
-          }
-          const messages = hookOutput.messages
-          if (!Array.isArray(messages) || messages.length === 0) return
-
-          // 限定 role==="user"，避免普通对话中碰巧含 marker 字符串被误判
-          const looksLikeTitleCall = messages.some((m) => {
-            const role = m?.info?.role ?? (m as { role?: string })?.role
-            if (role !== "user") return false
-            try {
-              return JSON.stringify(m).includes(TITLE_USER_MSG_MARKER)
-            } catch {
-              return false
-            }
-          })
-          if (!looksLikeTitleCall) return
-
-          // Extract sessionID from the first message that has one.
-          const sessionID = messages.find((m) => m?.info?.sessionID)?.info?.sessionID
-
-          if (!enabled) {
-            log("title generation detected (disabled, no filtering), messages:", messages.length)
-            return
-          }
-
-          // Compute tokens saved from removing system/developer messages.
-          // This is where project-specific content (AGENTS.md, magic-context
-          // memory, skill listings) lives - it's injected as system-role
-          // messages by other plugins, not in the system array.
-          const systemEntry = sessionID ? systemSavedBySession.get(sessionID) : undefined
-          const modelID = systemEntry?.modelID ?? ""
-          const countTokens = pickTokenCounter(modelID)
-
-          const removedMessages = messages.filter((m) => {
-            const role = m?.info?.role ?? (m as { role?: string })?.role
-            return role === "system" || role === "developer"
-          })
-          const messageSaved = removedMessages.reduce(
-            (sum, m) => sum + estimateMessageTokens(m, countTokens),
-            0,
-          )
-
-          const before = messages.length
-          const kept = messages.filter((m) => {
-            const role = m?.info?.role ?? (m as { role?: string })?.role
-            return role !== "system" && role !== "developer"
-          })
-
-          if (kept.length < before) {
-            messages.length = 0
-            kept.forEach((m) => messages.push(m))
-          }
-
-          // Combine system + message savings for the toast.
-          const systemSaved = systemEntry?.saved ?? 0
-          const totalSaved = systemSaved + messageSaved
-
-          log(
-            "messages.transform: title call detected,",
-            "removed", before - kept.length, "system/developer entries,",
-            "message saved", messageSaved, "tokens,",
-            "system saved", systemSaved, "tokens,",
-            "total saved", totalSaved, "tokens",
-          )
-
-          // Clean up shared state.
-          if (sessionID) {
-            systemSavedBySession.delete(sessionID)
-            const timer = fallbackTimers.get(sessionID)
-            if (timer) {
-              clearTimeout(timer)
-              fallbackTimers.delete(sessionID)
-            }
-
-            if (notify) {
-              monitorTitleAndNotify(
-                input as unknown as { client: ClientLike },
-                sessionID, totalSaved, notifyTimeout, log,
-              ).catch((e) => log("notify: monitor error:", e))
-            }
-          }
-        } catch (e) {
-          log("messages.transform error:", e)
-        }
-      })
-    : undefined
-
   return {
     "experimental.chat.system.transform": systemTransform,
-    ...(messagesTransform
-      ? { "experimental.chat.messages.transform": messagesTransform }
-      : {}),
   }
 }
 
