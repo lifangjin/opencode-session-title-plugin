@@ -2,12 +2,25 @@ import type { Plugin } from "@opencode-ai/plugin"
 import { countTokens as countTokensCl100k } from "gpt-tokenizer"
 import { countTokens as countTokensO200k } from "gpt-tokenizer/encoding/o200k_base"
 
+/* eslint-disable @typescript-eslint/no-explicit-any */
+declare function require(id: string): any
+declare const process: { env: { HOME?: string } }
+
+// ── Lazy-loaded modules (required once, cached by Node/Bun) ──────────────
+let _fs: any = null
+let _path: any = null
+const fs = () => _fs ?? (_fs = require("fs"))
+const path = () => _path ?? (_path = require("path"))
+
+// ── Plugin version (synced with package.json) ────────────────────────────
+const PLUGIN_VERSION = "0.0.4"
+
 /**
  * Session Title Filter Plugin options.
  */
 export interface SessionTitleFilterOptions {
   /**
-   * Print debug logs to stderr (visible in opencode logs).
+   * Print debug logs to stderr and a log file.
    * @default false
    */
   debug?: boolean
@@ -18,33 +31,24 @@ export interface SessionTitleFilterOptions {
    */
   enabled?: boolean
   /**
-   * Also filter `experimental.chat.messages.transform` to drop system-role
-   * messages injected by other plugins when generating a title.
-   * @default true
-   */
-  filterMessages?: boolean
-  /**
-   * Show a TUI toast when title generation completes, reporting the generated
-   * title and approximate tokens saved. Uses opencode's `tui.showToast` API
-   * via the plugin SDK client.
+   * Show a TUI toast immediately after calculating token savings.
    * @default true
    */
   notify?: boolean
-  /**
-   * Max seconds to poll for the generated title before giving up the toast.
-   * Title generation is async; the hook fires before the LLM call, so the
-   * plugin polls `session.get` until the title changes.
-   * @default 30
-   */
-  notifyTimeout?: number
 }
 
 /**
  * Marker string that uniquely identifies opencode's built-in title agent prompt.
  * Source: packages/core/src/plugin/agent.ts -> PROMPT_TITLE
  *   "You are a title generator. You output ONLY a thread title. Nothing else."
+ *
+ * Must use the FULL first line (not just "You are a title generator") because
+ * other agents' system prompts may reference this string in comments, e.g.:
+ *   `"You are a title generator"` - 来自 opencode core ...
+ * The full sentence with ". You output ONLY" only appears in the actual
+ * PROMPT_TITLE, never in comments or cross-references.
  */
-const TITLE_MARKER = "You are a title generator"
+const TITLE_MARKER = "You are a title generator. You output ONLY a thread title. Nothing else."
 
 /**
  * PROMPT_TITLE ends with a closing </examples> tag. Anything after it inside
@@ -53,7 +57,13 @@ const TITLE_MARKER = "You are a title generator"
  */
 const TITLE_PROMPT_END = "</examples>"
 
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+/** TUI toast display duration (ms). */
+const TOAST_DURATION_MS = 5000
+/** How long to remember a session has already toasted (ms), to prevent
+ * duplicate toasts from LLM retries. */
+const TOAST_DEDUP_MS = 60_000
+/** Max number of system dump files to keep in debug mode. */
+const MAX_DUMP_FILES = 10
 
 /**
  * Select the correct tokenizer encoding for a given model.
@@ -70,49 +80,27 @@ const isO200kModel = (modelID: string): boolean => {
 const pickTokenCounter = (modelID: string): ((text: string) => number) =>
   isO200kModel(modelID) ? countTokensO200k : countTokensCl100k
 
-/** Polling interval (ms) for monitorTitleAndNotify. */
-const POLL_INTERVAL_MS = 1000
-/** Polling max interval (ms) for monitorTitleAndNotify (exponential backoff cap). */
-const POLL_MAX_INTERVAL_MS = 5000
-/** TUI toast display duration (ms). */
-const TOAST_DURATION_MS = 5000
-/** How long to remember a session has already toasted (ms), to prevent
- * duplicate toasts from LLM retries. */
-const TOAST_DEDUP_MS = 60_000
-
 /**
- * opencode sets a default title on new sessions before the title agent runs.
- * Heuristic reconstruction of opencode's `Session.isDefaultTitle` — matches
- * uuid-ish session IDs, empty strings, and common default labels. This is a
- * best-effort guess and may drift from opencode's actual defaults; if a real
- * title ever matches one of these patterns the toast would be skipped.
- * Source: SessionPrompt.ensureTitle skips when `!Session.isDefaultTitle`.
+ * Extract the pure PROMPT_TITLE from a system entry that may have other
+ * content prepended or appended by other plugins.
+ *
+ * @returns The substring from TITLE_MARKER to TITLE_PROMPT_END (inclusive).
+ *          If either marker is missing, returns the original entry unchanged
+ *          (safe fallback — no stripping).
  */
-const DEFAULT_TITLE_PATTERNS = ["new session", "new conversation", "untitled", "untitled session"]
-const isDefaultTitle = (title: unknown): boolean => {
-  if (typeof title !== "string") return true
-  if (title.length === 0) return true
-  // uuid-ish session IDs (full match)
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(title)) return true
-  return DEFAULT_TITLE_PATTERNS.includes(title.toLowerCase())
+const extractPureTitle = (entry: string): string => {
+  const startIdx = entry.indexOf(TITLE_MARKER)
+  if (startIdx === -1) return entry
+  const endIdx = entry.indexOf(TITLE_PROMPT_END, startIdx)
+  if (endIdx === -1) return entry
+  return entry.slice(startIdx, endIdx + TITLE_PROMPT_END.length)
 }
 
 /**
- * Minimal shape of the opencode SDK client surface we use. The real client is
- * `ReturnType<typeof createOpencodeClient>`; we narrow to the two methods we
- * call so the plugin stays decoupled from SDK version drift.
- *
- * SDK parameter shapes (from @opencode-ai/sdk gen types):
- *   session.get:   { path: { id: string }, query?: { directory?: string } }
+ * Minimal shape of the opencode SDK client surface we use.
  *   tui.showToast: { body: { title?, message, variant, duration? } }
- * URL templates: "/session/{id}", "/tui/show-toast".
  */
 type ClientLike = {
-  session: {
-    get: (params: { path: { id: string } }) => Promise<{
-      data?: { title?: string }
-    }>
-  }
   tui: {
     showToast: (params: {
       body: {
@@ -126,79 +114,61 @@ type ClientLike = {
 }
 
 /**
- * After the system.transform hook strips irrelevant injections, title
- * generation runs async in the background. Poll session.get approximately
- * every POLL_INTERVAL_MS (plus RPC latency) until the title flips from its
- * default to a real value, then fire a TUI toast.
+ * Show a toast immediately with the token savings. No polling needed -
+ * savedTokens is already computed in system.transform before the LLM call.
  *
  * Dedup: `toastedSessions` prevents duplicate toasts when the LLM call is
- * retried (each retry fires system.transform → messages.transform → another
- * monitor). Once a toast has been shown for a session, subsequent monitors
- * exit silently.
+ * retried (each retry fires system.transform -> another toast attempt).
  */
 const toastedSessions = new Set<string>()
 
-async function monitorTitleAndNotify(
+async function showToastImmediate(
   input: { client: ClientLike },
   sessionID: string,
   savedTokens: number,
-  timeoutSec: number,
   log: (...args: unknown[]) => void,
 ): Promise<void> {
   if (toastedSessions.has(sessionID)) {
     log("notify: toast already shown for session, skipping duplicate")
     return
   }
+  toastedSessions.add(sessionID)
+  setTimeout(() => toastedSessions.delete(sessionID), TOAST_DEDUP_MS)
 
-  let initialTitle: string | undefined
+  const message =
+    savedTokens > 0
+      ? `Title call saved ${savedTokens} tokens`
+      : `Title call system prompt stripped`
   try {
-    const res = await input.client.session.get({ path: { id: sessionID } })
-    initialTitle = res?.data?.title
+    await input.client.tui.showToast({
+      body: {
+        title: "Session title filter",
+        message,
+        variant: "success",
+        duration: TOAST_DURATION_MS,
+      },
+    })
+    log("notify: toast shown, savedTokens:", savedTokens)
   } catch (e) {
-    log("notify: failed to get initial session:", e)
-    return
+    log("notify: showToast failed:", e)
   }
+}
 
-  const deadline = Date.now() + timeoutSec * 1000
-  let delay = POLL_INTERVAL_MS
-  while (Date.now() < deadline) {
-    await sleep(delay)
-    delay = Math.min(delay * 2, POLL_MAX_INTERVAL_MS)
-    try {
-      const res = await input.client.session.get({ path: { id: sessionID } })
-      const title = res?.data?.title
-      if (title && title !== initialTitle && !isDefaultTitle(title)) {
-        if (toastedSessions.has(sessionID)) {
-          log("notify: toast already shown by a concurrent monitor, skipping")
-          return
-        }
-        toastedSessions.add(sessionID)
-        setTimeout(() => toastedSessions.delete(sessionID), TOAST_DEDUP_MS)
-
-        const message =
-          savedTokens > 0
-            ? `"${title}" | title call saved ${savedTokens} tokens`
-            : `"${title}" generated with stripped system prompt`
-        try {
-          await input.client.tui.showToast({
-            body: {
-              title: "Session title ready",
-              message,
-              variant: "success",
-              duration: TOAST_DURATION_MS,
-            },
-          })
-          log("notify: toast shown for title:", title, "savedTokens:", savedTokens)
-        } catch (e) {
-          log("notify: showToast failed:", e)
-        }
-        return
-      }
-    } catch (e) {
-      log("notify: poll error:", e)
+/**
+ * Clean up old system dump files, keeping only the most recent MAX_DUMP_FILES.
+ * Only called in debug mode.
+ */
+function cleanupDumpFiles(logDir: string): void {
+  try {
+    const entries = fs().readdirSync(logDir) as string[]
+    const dumps = entries
+      .filter((f) => f.startsWith("session-title-filter-system-") && f.endsWith(".txt"))
+      .sort()
+    if (dumps.length <= MAX_DUMP_FILES) return
+    for (const old of dumps.slice(0, dumps.length - MAX_DUMP_FILES)) {
+      try { fs().unlinkSync(path().join(logDir, old)) } catch {}
     }
-  }
-  log("notify: timeout after", timeoutSec, "s, title not generated")
+  } catch {}
 }
 
 /**
@@ -212,37 +182,39 @@ async function monitorTitleAndNotify(
  * every new session.
  *
  * Detection: the title agent's prompt is a constant that begins with
- * "You are a title generator". When the hook fires and any system string
- * contains that marker, we know this LLM call is title generation.
+ * "You are a title generator. You output ONLY a thread title. Nothing else."
+ * When the hook fires and any system string contains that full sentence, we
+ * know this LLM call is title generation.
  */
 export const SessionTitleFilterPlugin: Plugin = async (input, options: SessionTitleFilterOptions = {}) => {
   const debug = options.debug === true
   const enabled = options.enabled !== false
   const notify = options.notify !== false
-  const notifyTimeout = options.notifyTimeout && options.notifyTimeout > 0 ? options.notifyTimeout : 30
 
-  const log = debug
-    ? (...args: unknown[]) => console.error("[session-title-filter]", ...args)
-    : () => {}
-
-  log("plugin v0.0.4 loaded, enabled:", enabled, "notify:", notify)
-
-  const extractPureTitle = (entry: string): string => {
-    // opencode 在 LLMRequestPrep.prepare 中先把 agent.prompt + e.system +
-    // user.system 用 "\n" join 成单个字符串再放入 system 数组（初始 length=1）。
-    // 其他 plugin（magic-context、oh-my-opencode-slim 等）还可能往 system 里
-    // push 新 entry 或修改已有 entry。因此 PROMPT_TITLE 不一定在 entry 开头。
-    // 用 indexOf 定位 TITLE_MARKER 在 entry 中的任意起点，再找 TITLE_PROMPT_END
-    // 终点，slice 出纯 PROMPT_TITLE 段。
-    const startIdx = entry.indexOf(TITLE_MARKER)
-    if (startIdx === -1) return entry
-    const endIdx = entry.indexOf(TITLE_PROMPT_END, startIdx)
-    if (endIdx === -1) {
-      log("PROMPT_TITLE_END not found, marker may have drifted; plugin ineffective for this call")
-      return entry
+  const logDir = (() => {
+    try {
+      const d = path().join(process.env.HOME || "", ".local/share/opencode/log")
+      fs().mkdirSync(d, { recursive: true })
+      return d
+    } catch {
+      return null
     }
-    return entry.slice(startIdx, endIdx + TITLE_PROMPT_END.length)
+  })()
+
+  const log = (...args: unknown[]) => {
+    if (!debug) return
+    const msg = `[session-title-filter] ${args
+      .map((a) => (typeof a === "string" ? a : JSON.stringify(a)))
+      .join(" ")}\n`
+    console.error("[session-title-filter]", ...args)
+    if (logDir) {
+      try {
+        fs().appendFileSync(path().join(logDir, "session-title-filter.log"), msg)
+      } catch {}
+    }
   }
+
+  log(`plugin v${PLUGIN_VERSION} loaded, enabled:`, enabled, "notify:", notify)
 
   const systemTransform: NonNullable<
     Awaited<ReturnType<Plugin>>["experimental.chat.system.transform"]
@@ -261,21 +233,32 @@ export const SessionTitleFilterPlugin: Plugin = async (input, options: SessionTi
         return
       }
 
-      // Read model from hook input to select the correct tokenizer encoding.
       const modelInfo = (hookInput as { model?: { id?: string } })?.model
       const modelID = modelInfo?.id ?? ""
       const countTokens = pickTokenCounter(modelID)
 
       // ── Detailed debug: dump every system entry ──
-      for (let i = 0; i < system.length; i++) {
-        const entry = system[i]
-        if (typeof entry !== "string") {
-          log(`  system[${i}]: <non-string ${typeof entry}>`)
-          continue
+      if (debug && logDir) {
+        if (debug) cleanupDumpFiles(logDir)
+        for (let i = 0; i < system.length; i++) {
+          const entry = system[i]
+          if (typeof entry !== "string") {
+            log(`  system[${i}]: <non-string ${typeof entry}>`)
+            continue
+          }
+          const head = entry.slice(0, 120)
+          const tail = entry.slice(-120)
+          log(`  system[${i}]: len=${entry.length} head=${JSON.stringify(head)} tail=${JSON.stringify(tail)}`)
+
+          // Dump full entry to separate file for inspection
+          try {
+            const dumpPath = path().join(logDir, `session-title-filter-system-${i}-${Date.now()}.txt`)
+            fs().writeFileSync(dumpPath, entry)
+            log(`  system[${i}]: full dump written to ${dumpPath}`)
+          } catch (e) {
+            log(`  system[${i}]: dump failed:`, e)
+          }
         }
-        const head = entry.slice(0, 120)
-        const tail = entry.slice(-120)
-        log(`  system[${i}]: len=${entry.length} head=${JSON.stringify(head)} tail=${JSON.stringify(tail)}`)
       }
 
       const originalText = system
@@ -308,10 +291,10 @@ export const SessionTitleFilterPlugin: Plugin = async (input, options: SessionTi
       if (notify) {
         const sessionID = (hookInput as { sessionID?: string })?.sessionID
         if (sessionID) {
-          monitorTitleAndNotify(
+          showToastImmediate(
             input as unknown as { client: ClientLike },
-            sessionID, savedTokens, notifyTimeout, log,
-          ).catch((e) => log("notify: monitor error:", e))
+            sessionID, savedTokens, log,
+          ).catch((e) => log("notify: error:", e))
         } else {
           log("notify: no sessionID in hook input, skipping toast")
         }
