@@ -16,7 +16,7 @@ const fs = () => _fs ?? (_fs = require("fs"))
 const path = () => _path ?? (_path = require("path"))
 
 // ── Plugin version (synced with package.json) ────────────────────────────
-const PLUGIN_VERSION = "0.0.6"
+const PLUGIN_VERSION = "0.0.7"
 
 /**
  * Session Title Filter Plugin options.
