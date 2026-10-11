@@ -21,6 +21,14 @@ You are a title generator. You output ONLY a thread title. Nothing else.
 
 ## 工作原理
 
+同一个 default export 同时支持两代 opencode：v2 调用 `setup()`，v1（>= 1.18.29）调用 `server()`。
+
+### opencode v2
+
+插件注册专属的 `title` 会话 hook（`ctx.session.hook("title", ...)`），该 hook 只在标题生成请求时触发--检测是结构性的，无需靠内容嗅探定位调用。system 载荷为 `Array<SystemPart>`；opencode 核心将其初始化为恰好 `[SystemPart.make(PROMPT_TITLE)]`，其他插件的 `title` hook 可能在我们之前或之后追加更多 part。插件仍靠下文的内容标记定位纯 `PROMPT_TITLE`，剥离其余所有 part，并将数组原地替换为单个 `{ type: "text", text: pureTitle }` part。
+
+### opencode v1
+
 插件 hook 了 `experimental.chat.system.transform`：
 
 1. **检测**：当任意 system 字符串包含完整句子 `"You are a title generator. You output ONLY a thread title. Nothing else."`（opencode `PROMPT_TITLE` 的首行）时，判定为标题生成调用。必须使用完整句子--短标记如 `"You are a title generator"` 会匹配其他 agent 系统提示词中的注释引用，导致误触发。
@@ -40,7 +48,16 @@ You are a title generator. You output ONLY a thread title. Nothing else.
 ### 作为已发布包
 
 ```jsonc
-// ~/.config/opencode/opencode.json
+// opencode v2 配置："plugins" + 对象形式
+{
+  "plugins": [
+    "@lifangjin/opencode-session-title-plugin@latest"
+  ]
+}
+```
+
+```jsonc
+// opencode v1 配置："plugin" + 元组形式（~/.config/opencode/opencode.json）
 {
   "plugin": [
     "@lifangjin/opencode-session-title-plugin@latest"
@@ -51,6 +68,19 @@ You are a title generator. You output ONLY a thread title. Nothing else.
 ### 带选项
 
 ```jsonc
+// opencode v2
+{
+  "plugins": [
+    {
+      "package": "@lifangjin/opencode-session-title-plugin@latest",
+      "options": { "debug": true }
+    }
+  ]
+}
+```
+
+```jsonc
+// opencode v1
 {
   "plugin": [
     ["@lifangjin/opencode-session-title-plugin@latest", { "debug": true }]
@@ -61,6 +91,16 @@ You are a title generator. You output ONLY a thread title. Nothing else.
 ### 从源码构建（本地开发）
 
 ```jsonc
+// opencode v2
+{
+  "plugins": [
+    { "package": "/path/to/opencode-session-title-plugin", "options": { "debug": true } }
+  ]
+}
+```
+
+```jsonc
+// opencode v1
 {
   "plugin": [
     ["/path/to/opencode-session-title-plugin", { "debug": true }]
@@ -76,7 +116,7 @@ You are a title generator. You output ONLY a thread title. Nothing else.
 | --------- | --------- | ------- | -------------------------------------------------------------------------------------- |
 | `debug`   | `boolean` | `false` | 将检测/过滤详情写入 `~/.local/share/opencode/log/session-title-filter.log` 和 stderr。同时将完整 system 内容 dump 到带时间戳的 `.txt` 文件（最多保留 10 个）。 |
 | `enabled` | `boolean` | `true`  | 总开关。设为 `false` 则仅检测不修改。                                                    |
-| `notify`  | `boolean` | `true`  | 计算完 token 节省量后立即显示 TUI toast。                                                 |
+| `notify`  | `boolean` | `true`  | 计算完 token 节省量后立即显示 TUI toast。仅 v1 API 生效--v2 服务端插件没有 TUI toast API，改为只写日志。 |
 
 ### Toast
 
@@ -129,9 +169,32 @@ opencode title agent 的模型优先级（来源：`packages/opencode/src/sessio
 
 ## 兼容性
 
-- opencode with `@opencode-ai/plugin` >= 1.4.0
-- 使用的 hook：仅 `experimental.chat.system.transform`
-- 检测标记（`"You are a title generator. You output ONLY a thread title. Nothing else."`）绑定 opencode 内置的 `PROMPT_TITLE`。如果 opencode 修改了 title agent 的 prompt，需更新 `src/index.ts` 中的 `TITLE_MARKER`。
+一个包同时支持两代（按官方迁移指南的双栈入口）：
+
+- opencode v2（`@opencode/plugin` >= 2.0.0）：专属 `title` 会话 hook；检测是结构性的（该 hook 只在标题请求时触发）。
+- opencode v1（`@opencode-ai/plugin` >= 1.18.29）：`experimental.chat.system.transform`；检测基于内容。
+- 更老的 v1 版本（< 1.18.29）只支持函数式 default export--请固定使用 `@lifangjin/opencode-session-title-plugin@0.0.x`。
+- 检测标记（`"You are a title generator. You output ONLY a thread title. Nothing else."`）绑定 opencode 内置的 `PROMPT_TITLE`（截至 v2 2.0.26 已核实未变）。如果 opencode 修改了 title agent 的 prompt，需更新 `src/index.ts` 中的 `TITLE_MARKER`。
+
+## 还需要这个插件吗？
+
+老实说：**这个插件的原使命，opencode v2 已在架构层面解决了大半。**
+
+- v1 的病根是一个万能的 `experimental.chat.system.transform`，管所有 LLM 调用--其他插件注入的项目记忆、skill 列表连 title 调用一起污染，本插件负责事后剥离。
+- v2 把 hook 按请求种类拆开：`context`（主对话循环）、`compaction`、`generate`、`title` 各管各的请求。插件注册 `context` hook 不再波及 title 请求。
+- v2 的 title 请求初始 system 恰为 `[SystemPart.make(PROMPT_TITLE)]`；标题输入也由 core 限量（首条用户消息截断至 2000 字符，重新生成时上下文封顶 8000 字符）。
+
+v2 下残存的价值：
+
+1. **防御**：若某插件显式注册 `title` hook 并追加内容，本插件仍能剥掉--但取决于 hook 执行顺序（必须后于对方运行），保障力不如 v1。目前 v2 生态未见这种用法。
+2. **观测**：token 节省量日志（v2 无 toast；v1 路径保留弹窗）。
+
+留着几乎零成本：marker 缺失时安全 no-op，system 本就干净时幂等。
+
+建议：
+
+- 还在 v1（当前 stable 线）：**留着，这正是它的用武之地。**
+- 已全面转 v2：可当便宜的保险丝加仪表盘，也可卸掉。若目标是省钱，更大的杠杆是给标题生成配便宜模型--v2 配置 `agents.title.model`（取代 v1 的 `small_model`），靠配置即可，无需插件。
 
 ## License
 

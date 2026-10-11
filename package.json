@@ -48,12 +48,22 @@
   "license": "MIT",
   "devDependencies": {
     "@opencode-ai/plugin": "^1.4.6",
+    "@opencode/plugin": "^2.0.26",
     "typescript": "^5.6.0"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.4.0"
+    "@opencode-ai/plugin": ">=1.18.29",
+    "@opencode/plugin": ">=2.0.0"
   },
   "dependencies": {
     "gpt-tokenizer": "^3.4.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    },
+    "@opencode/plugin": {
+      "optional": true
+    }
   }
 }
